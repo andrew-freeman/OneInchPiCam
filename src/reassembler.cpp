@@ -29,7 +29,8 @@ void Reassembler::drop_expired(FrameMap& frames, uint32_t latest_frame_id) {
 }
 
 bool Reassembler::add_fragment(const RawUdpHeader& header, const uint8_t* payload,
-                               std::size_t payload_size, CompletedFrame& out) {
+                               std::size_t payload_size, CompletedFrame& out,
+                               std::chrono::steady_clock::time_point recv_time) {
     FrameMap& frame_map = flows_[header.flow_id];
     drop_expired(frame_map, header.frame_id);
 
@@ -44,6 +45,8 @@ bool Reassembler::add_fragment(const RawUdpHeader& header, const uint8_t* payloa
         }
         assembly.buffer.resize(assembly.frame_size, 0);
         assembly.fragments.assign(header.fragment_count, false);
+        assembly.first_packet_time = recv_time;
+        assembly.have_first_time = true;
     } else {
         // Validate consistency
         if (assembly.header.width != header.width || assembly.header.height != header.height ||
@@ -76,6 +79,8 @@ bool Reassembler::add_fragment(const RawUdpHeader& header, const uint8_t* payloa
     if (assembly.received_fragments == assembly.fragments.size()) {
         out.header = assembly.header;
         out.data = std::move(assembly.buffer);
+        out.complete_time = recv_time;
+        out.first_packet_time = assembly.have_first_time ? assembly.first_packet_time : recv_time;
         frame_map.erase(header.frame_id);
         return true;
     }

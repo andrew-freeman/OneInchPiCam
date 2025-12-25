@@ -8,17 +8,22 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "crc32.h"
+#include "frame_source.h"
 #include "generator.h"
+#include "libcamera_source.h"
 #include "protocol.h"
 
 using namespace std::chrono;
 
 namespace rawudp {
+
+enum class SourceType { File, Generator, Libcamera };
 
 struct SenderOptions {
     std::string dest_ip = "127.0.0.1";
@@ -34,6 +39,11 @@ struct SenderOptions {
     uint32_t payload_size = 1200;
     uint32_t frame_count = 0; // 0 = infinite
     std::string raw_file;
+    SourceType source = SourceType::File;
+    bool list_cameras = false;
+    int camera_index = 0;
+    uint16_t effective_bits = 12;
+    uint16_t container_bits = 16;
 };
 
 void usage(const char* argv0) {
@@ -49,10 +59,25 @@ void usage(const char* argv0) {
               << "  --fps <value>          Frames per second (default 30)\n"
               << "  --frames <n>           Number of frames to send (0 = infinite)\n"
               << "  --flow-id <id>         Flow identifier (default 1)\n"
-              << "  --raw-file <path>      Replay raw file instead of synthetic pattern\n";
+              << "  --raw-file <path>      Replay raw file instead of synthetic pattern\n"
+              << "  --source <src>         file|generator|libcamera (default file)\n"
+              << "  --camera <index>       Camera index for libcamera (default 0)\n"
+              << "  --list-cameras         List available cameras and exit\n"
+              << "  --effective-bits <N>   Sensor effective bits (default 12)\n"
+              << "  --container-bits <N>   Container bit depth (default 16)\n";
+}
+
+SourceType parse_source(const std::string& name) {
+    if (name == "file") return SourceType::File;
+    if (name == "generator") return SourceType::Generator;
+    if (name == "libcamera") return SourceType::Libcamera;
+    throw std::invalid_argument("Unknown source: " + name);
 }
 
 bool parse_args(int argc, char** argv, SenderOptions& opts) {
+    bool source_set = false;
+    bool container_set = false;
+    bool effective_set = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         auto require_value = [&](const std::string& name) -> std::string {
@@ -70,6 +95,8 @@ bool parse_args(int argc, char** argv, SenderOptions& opts) {
             opts.height = std::stoi(require_value(arg));
         } else if (arg == "--bit-depth") {
             opts.bit_depth = static_cast<uint16_t>(std::stoi(require_value(arg)));
+            if (!effective_set) opts.effective_bits = opts.bit_depth;
+            if (!container_set) opts.container_bits = opts.bit_depth;
         } else if (arg == "--pixel-format") {
             opts.pixel_format = parse_pixel_format(require_value(arg));
         } else if (arg == "--pattern") {
@@ -85,6 +112,20 @@ bool parse_args(int argc, char** argv, SenderOptions& opts) {
         } else if (arg == "--raw-file") {
             opts.raw_file = require_value(arg);
             opts.pattern = Pattern::FileReplay;
+            if (!source_set) opts.source = SourceType::File;
+        } else if (arg == "--source") {
+            opts.source = parse_source(require_value(arg));
+            source_set = true;
+        } else if (arg == "--camera") {
+            opts.camera_index = std::stoi(require_value(arg));
+        } else if (arg == "--list-cameras") {
+            opts.list_cameras = true;
+        } else if (arg == "--effective-bits") {
+            opts.effective_bits = static_cast<uint16_t>(std::stoi(require_value(arg)));
+            effective_set = true;
+        } else if (arg == "--container-bits") {
+            opts.container_bits = static_cast<uint16_t>(std::stoi(require_value(arg)));
+            container_set = true;
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0]);
             return false;
@@ -92,13 +133,19 @@ bool parse_args(int argc, char** argv, SenderOptions& opts) {
             throw std::runtime_error("Unknown argument: " + arg);
         }
     }
+    if (!source_set && opts.raw_file.empty()) {
+        // Preserve legacy default behavior if no raw file is provided.
+        opts.source = SourceType::Generator;
+    }
     return true;
 }
 
 bool validate_options(const SenderOptions& opts) {
     if (opts.width <= 0 || opts.height <= 0) {
-        std::cerr << "Width and height must be positive\n";
-        return false;
+        if (opts.source != SourceType::Libcamera) {
+            std::cerr << "Width and height must be positive\n";
+            return false;
+        }
     }
     if (opts.payload_size == 0) {
         std::cerr << "Payload size must be greater than zero\n";
@@ -108,12 +155,22 @@ bool validate_options(const SenderOptions& opts) {
         std::cerr << "Bit depth must be between 1 and 16\n";
         return false;
     }
+    if (opts.effective_bits == 0 || opts.effective_bits > 16 ||
+        opts.container_bits == 0 || opts.container_bits > 16 ||
+        opts.effective_bits > opts.container_bits) {
+        std::cerr << "Effective/container bits must be within 1-16 and effective <= container\n";
+        return false;
+    }
+    if (opts.source == SourceType::File && opts.raw_file.empty()) {
+        std::cerr << "File source selected but no raw file provided\n";
+        return false;
+    }
     return true;
 }
 
-void build_header(RawUdpHeader& hdr, const SenderOptions& opts, uint32_t frame_id,
-                  uint32_t fragment_id, uint32_t fragment_count, uint64_t timestamp_us,
-                  uint32_t payload_offset, uint32_t payload_size) {
+void build_header(RawUdpHeader& hdr, const SenderOptions& opts, const FrameMeta& meta,
+                  uint32_t frame_id, uint32_t fragment_id, uint32_t fragment_count,
+                  uint64_t timestamp_us, uint32_t payload_offset, uint32_t payload_size) {
     hdr.magic = host_to_net32(kMagic);
     hdr.version = host_to_net16(kVersion);
     hdr.header_size = host_to_net16(rawudp_header_size());
@@ -121,12 +178,12 @@ void build_header(RawUdpHeader& hdr, const SenderOptions& opts, uint32_t frame_i
     hdr.frame_id = host_to_net32(frame_id);
     hdr.fragment_id = host_to_net32(fragment_id);
     hdr.fragment_count = host_to_net32(fragment_count);
-    hdr.width = host_to_net16(static_cast<uint16_t>(opts.width));
-    hdr.height = host_to_net16(static_cast<uint16_t>(opts.height));
-    hdr.bit_depth = static_cast<uint8_t>(opts.bit_depth);
-    hdr.pixel_format = static_cast<uint8_t>(opts.pixel_format);
+    hdr.width = host_to_net16(static_cast<uint16_t>(meta.width));
+    hdr.height = host_to_net16(static_cast<uint16_t>(meta.height));
+    hdr.bit_depth = static_cast<uint8_t>(meta.container_bits);
+    hdr.pixel_format = static_cast<uint8_t>(meta.pixel_format);
     hdr.packing = static_cast<uint8_t>(opts.packing);
-    hdr.reserved = 0;
+    hdr.reserved = static_cast<uint8_t>(std::min<uint16_t>(meta.effective_bits, 0xff));
     hdr.timestamp_us = host_to_net64(timestamp_us);
     hdr.payload_offset = host_to_net32(payload_offset);
     hdr.payload_size = host_to_net32(payload_size);
@@ -148,16 +205,53 @@ int main(int argc, char** argv) {
         usage(argv[0]);
         return 1;
     }
+
+    if (opts.list_cameras) {
+        list_cameras();
+        return 0;
+    }
+
     if (!validate_options(opts)) {
         usage(argv[0]);
         return 1;
     }
 
+    std::unique_ptr<FrameSource> source;
     std::vector<uint16_t> replay_frame;
-    if (!opts.raw_file.empty()) {
-        if (!load_raw_file(opts.raw_file, opts.width, opts.height, replay_frame)) {
+    if (opts.source == SourceType::File) {
+        auto file_source = std::make_unique<RawFileSource>(opts.raw_file, opts.width, opts.height,
+                                                           opts.pixel_format, opts.container_bits,
+                                                           opts.effective_bits);
+        if (!file_source->valid()) {
             return 1;
         }
+        source = std::move(file_source);
+    } else if (opts.source == SourceType::Generator) {
+        if (opts.pattern == Pattern::FileReplay || !opts.raw_file.empty()) {
+            if (!load_raw_file(opts.raw_file, opts.width, opts.height, replay_frame)) {
+                return 1;
+            }
+        }
+        source = std::make_unique<SyntheticSource>(
+            opts.pattern, opts.width, opts.height, opts.pixel_format, opts.container_bits,
+            opts.effective_bits, replay_frame.empty() ? nullptr : &replay_frame);
+    } else if (opts.source == SourceType::Libcamera) {
+        LibcameraConfig cfg;
+        cfg.camera_index = opts.camera_index;
+        cfg.width = opts.width;
+        cfg.height = opts.height;
+        cfg.container_bits = opts.container_bits;
+        cfg.effective_bits = opts.effective_bits;
+        source = make_libcamera_source(cfg);
+        if (!source) {
+            std::cerr << "Failed to initialize libcamera source\n";
+            return 1;
+        }
+    }
+
+    if (!source) {
+        std::cerr << "No frame source configured\n";
+        return 1;
     }
 
     int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -174,40 +268,48 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const std::size_t frame_bytes = static_cast<std::size_t>(opts.width) * opts.height * 2;
-    std::vector<uint8_t> payload(frame_bytes);
     const Crc32 crc;
-    const auto frame_interval = duration<double>(1.0 / std::max<uint32_t>(1, opts.fps));
+    const bool throttle = opts.source != SourceType::Libcamera;
+    const auto frame_interval = throttle ? duration<double>(1.0 / std::max<uint32_t>(1, opts.fps))
+                                         : duration<double>(0);
     auto next_time = steady_clock::now();
 
     uint32_t frames_sent = 0;
     while (opts.frame_count == 0 || frames_sent < opts.frame_count) {
-        const uint32_t frame_id = frames_sent;
-        const std::vector<uint16_t> frame = generate_frame(
-            opts.pattern, opts.width, opts.height, opts.bit_depth, opts.pixel_format, frame_id,
-            replay_frame.empty() ? nullptr : &replay_frame);
+        uint8_t* frame_ptr = nullptr;
+        std::size_t frame_size = 0;
+        uint64_t timestamp_us = 0;
+        FrameMeta meta;
+        if (!source->get_frame(frame_ptr, frame_size, timestamp_us, meta)) {
+            break;
+        }
 
-        for (std::size_t i = 0; i < frame.size(); ++i) {
-            uint16_t v = frame[i];
-            payload[i * 2] = static_cast<uint8_t>(v & 0xff);
-            payload[i * 2 + 1] = static_cast<uint8_t>((v >> 8) & 0xff);
+        if (frame_size == 0 || frame_ptr == nullptr) {
+            std::cerr << "Empty frame from source\n";
+            return 1;
+        }
+        if (meta.width <= 0 || meta.height <= 0) {
+            std::cerr << "Invalid frame dimensions from source\n";
+            return 1;
         }
 
         const uint32_t fragments =
-            static_cast<uint32_t>((frame_bytes + opts.payload_size - 1) / opts.payload_size);
+            static_cast<uint32_t>((frame_size + opts.payload_size - 1) / opts.payload_size);
 
-        uint64_t timestamp_us =
-            duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+        const uint32_t frame_id = frames_sent;
+        if (timestamp_us == 0) {
+            timestamp_us = duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+        }
 
         for (uint32_t frag = 0; frag < fragments; ++frag) {
             const uint32_t offset = frag * opts.payload_size;
-            const uint32_t remaining = static_cast<uint32_t>(frame_bytes - offset);
+            const uint32_t remaining = static_cast<uint32_t>(frame_size - offset);
             const uint32_t chunk = std::min(opts.payload_size, remaining);
 
             RawUdpHeader hdr{};
-            build_header(hdr, opts, frame_id, frag, fragments, timestamp_us, offset, chunk);
+            build_header(hdr, opts, meta, frame_id, frag, fragments, timestamp_us, offset, chunk);
 
-            uint32_t payload_crc = crc.compute(payload.data() + offset, chunk);
+            uint32_t payload_crc = crc.compute(frame_ptr + offset, chunk);
             hdr.payload_crc32 = host_to_net32(payload_crc);
             hdr.header_crc32 = 0;
             uint32_t header_crc =
@@ -216,7 +318,7 @@ int main(int argc, char** argv) {
 
             std::vector<uint8_t> packet(sizeof(RawUdpHeader) + chunk);
             std::memcpy(packet.data(), &hdr, sizeof(RawUdpHeader));
-            std::memcpy(packet.data() + sizeof(RawUdpHeader), payload.data() + offset, chunk);
+            std::memcpy(packet.data() + sizeof(RawUdpHeader), frame_ptr + offset, chunk);
 
             ssize_t sent = ::sendto(sock, packet.data(), packet.size(), 0,
                                     reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
@@ -227,8 +329,12 @@ int main(int argc, char** argv) {
         }
 
         frames_sent++;
-        next_time += duration_cast<steady_clock::duration>(frame_interval);
-        std::this_thread::sleep_until(next_time);
+        if (throttle) {
+            next_time += duration_cast<steady_clock::duration>(frame_interval);
+            std::this_thread::sleep_until(next_time);
+        } else {
+            next_time = steady_clock::now();
+        }
     }
 
     ::close(sock);

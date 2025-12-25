@@ -15,6 +15,19 @@ namespace {
 
 enum class Channel { R, G, B };
 
+uint8_t effective_bits_from_header(const RawUdpHeader& header) {
+    uint8_t bits = header.reserved != 0 ? header.reserved : header.bit_depth;
+    bits = std::clamp<uint8_t>(bits, 1, 16);
+    return bits;
+}
+
+double max_value_for_bits(uint8_t bits) {
+    if (bits >= 16) {
+        return 65535.0;
+    }
+    return static_cast<double>((1u << bits) - 1u);
+}
+
 Channel channel_at(int x, int y, PixelFormat fmt) {
     const bool even_row = (y % 2) == 0;
     const bool even_col = (x % 2) == 0;
@@ -49,10 +62,9 @@ uint8_t tone_map(double value, double max_value, const PreviewConfig& cfg, float
 }
 
 void mono_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-               const PreviewConfig& cfg, std::vector<uint8_t>& bgr) {
+               const PreviewConfig& cfg, std::vector<uint8_t>& bgr, double maxv) {
     const std::size_t pixel_count = static_cast<std::size_t>(header.width) * header.height;
     bgr.resize(pixel_count * 3);
-    const double maxv = static_cast<double>((1u << header.bit_depth) - 1u);
     for (std::size_t i = 0; i < pixel_count; ++i) {
         uint16_t raw = read_le16(frame_data, i * 2);
         const double value = std::max<int>(0, static_cast<int>(raw) - cfg.black_level);
@@ -64,10 +76,9 @@ void mono_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_dat
 }
 
 void green_only_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-                     const PreviewConfig& cfg, std::vector<uint8_t>& bgr) {
+                     const PreviewConfig& cfg, std::vector<uint8_t>& bgr, double maxv) {
     const std::size_t pixel_count = static_cast<std::size_t>(header.width) * header.height;
     bgr.resize(pixel_count * 3);
-    const double maxv = static_cast<double>((1u << header.bit_depth) - 1u);
     for (int y = 0; y < header.height; ++y) {
         for (int x = 0; x < header.width; ++x) {
             const std::size_t idx = static_cast<std::size_t>(y) * header.width + x;
@@ -86,11 +97,11 @@ void green_only_view(const RawUdpHeader& header, const std::vector<uint8_t>& fra
 }
 
 void half_res_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-                   const PreviewConfig& cfg, std::vector<uint8_t>& bgr, int& out_w, int& out_h) {
+                   const PreviewConfig& cfg, std::vector<uint8_t>& bgr, int& out_w, int& out_h,
+                   double maxv) {
     out_w = header.width / 2;
     out_h = header.height / 2;
     bgr.assign(static_cast<std::size_t>(out_w) * out_h * 3, 0);
-    const double maxv = static_cast<double>((1u << header.bit_depth) - 1u);
     for (int y = 0; y + 1 < header.height; y += 2) {
         for (int x = 0; x + 1 < header.width; x += 2) {
             const std::size_t idx00 = static_cast<std::size_t>(y) * header.width + x;
@@ -134,11 +145,10 @@ void half_res_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame
 }
 
 void bilinear_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-                   const PreviewConfig& cfg, std::vector<uint8_t>& bgr) {
+                   const PreviewConfig& cfg, std::vector<uint8_t>& bgr, double maxv) {
     const int w = header.width;
     const int h = header.height;
     bgr.assign(static_cast<std::size_t>(w) * h * 3, 0);
-    const double maxv = static_cast<double>((1u << header.bit_depth) - 1u);
     const PixelFormat fmt = static_cast<PixelFormat>(header.pixel_format);
 
     auto sample = [&](int x, int y) -> uint16_t {
@@ -191,8 +201,12 @@ void bilinear_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame
 bool render_preview(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
                     const PreviewConfig& cfg, std::vector<uint8_t>& bgr, int& out_width,
                     int& out_height) {
-    if (header.bit_depth == 0 || header.bit_depth > 16) {
-        std::cerr << "Unsupported bit depth: " << static_cast<int>(header.bit_depth) << "\n";
+    const uint8_t effective_bits = effective_bits_from_header(header);
+    if (effective_bits == 0 || effective_bits > 16 || header.bit_depth == 0 ||
+        header.bit_depth > 16) {
+        std::cerr << "Unsupported bit depth: "
+                  << "container=" << static_cast<int>(header.bit_depth)
+                  << " effective=" << static_cast<int>(effective_bits) << "\n";
         return false;
     }
     if (frame_data.size() < static_cast<std::size_t>(header.width) * header.height * 2) {
@@ -202,19 +216,20 @@ bool render_preview(const RawUdpHeader& header, const std::vector<uint8_t>& fram
 
     out_width = header.width;
     out_height = header.height;
+    const double maxv = max_value_for_bits(effective_bits);
 
     switch (cfg.mode) {
     case ViewMode::Mono:
-        mono_view(header, frame_data, cfg, bgr);
+        mono_view(header, frame_data, cfg, bgr, maxv);
         break;
     case ViewMode::GreenOnly:
-        green_only_view(header, frame_data, cfg, bgr);
+        green_only_view(header, frame_data, cfg, bgr, maxv);
         break;
     case ViewMode::HalfRes:
-        half_res_view(header, frame_data, cfg, bgr, out_width, out_height);
+        half_res_view(header, frame_data, cfg, bgr, out_width, out_height, maxv);
         break;
     case ViewMode::Bilinear:
-        bilinear_view(header, frame_data, cfg, bgr);
+        bilinear_view(header, frame_data, cfg, bgr, maxv);
         break;
     }
     return true;
