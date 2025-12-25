@@ -14,6 +14,7 @@
 #include <libcamera/pixel_format.h>
 #include <libcamera/request.h>
 #include <libcamera/stream.h>
+#include <libcamera/control_ids.h>
 #include <sys/mman.h>
 
 #include <condition_variable>
@@ -42,9 +43,15 @@ PixelFormat parse_bayer_format(const std::string& fmt) {
     return PixelFormat::MONO;
 }
 
+//bool is_packed_raw(const std::string& fmt) {
+//    return fmt.find("CSI2P") != std::string::npos || fmt.find("P") == fmt.size() - 1;
+//}
 bool is_packed_raw(const std::string& fmt) {
-    return fmt.find("CSI2P") != std::string::npos || fmt.find("P") == fmt.size() - 1;
+    return fmt.find("CSI2P") != std::string::npos ||
+           fmt.find("10") != std::string::npos ||
+           fmt.find("12") != std::string::npos;
 }
+
 
 int packed_bits(const std::string& fmt) {
     if (fmt.find("10") != std::string::npos) return 10;
@@ -107,6 +114,8 @@ uint16_t detect_container_bits(const std::string& fmt, uint16_t cli_bits) {
     if (fmt.find("12") != std::string::npos) return 16; // converted to 16-bit container
     if (fmt.find("10") != std::string::npos) return 16; // converted to 16-bit container
     return cli_bits;
+}
+
 }
 
 class LibcameraSource : public FrameSource {
@@ -186,7 +195,11 @@ void LibcameraSource::choose_format(libcamera::StreamConfiguration& cfg) {
     const libcamera::StreamFormats& formats = cfg.formats();
     for (const auto& fmt : formats.pixelformats()) {
         const std::string name = fmt.toString();
-        if (name.find("16") != std::string::npos) {
+        if ((name.find("RGGB") != std::string::npos ||
+             name.find("BGGR") != std::string::npos ||
+             name.find("GRBG") != std::string::npos ||
+             name.find("GBRG") != std::string::npos) &&
+            name.find("16") != std::string::npos) {
             cfg.pixelFormat = fmt;
             return;
         }
@@ -341,7 +354,16 @@ void LibcameraSource::handle_request(libcamera::Request* request) {
     libcamera::FrameBuffer* buffer = it->second;
 
     CapturedFrame frame;
-    frame.timestamp_us = monotonic_timestamp_us();
+    //frame.timestamp_us = monotonic_timestamp_us();
+    uint64_t ts_us = 0;
+    if (auto ts = request->metadata().get(libcamera::controls::SensorTimestamp)) {
+        //ts_us = ts->get() / 1000; // ns → us
+        ts_us = static_cast<uint64_t>(*ts) / 1000;
+    } else {
+        ts_us = monotonic_timestamp_us();
+    }
+    frame.timestamp_us = ts_us;
+
     if (!copy_buffer(buffer, frame.data)) {
         request->reuse(libcamera::Request::ReuseBuffers);
         camera_->queueRequest(request);
@@ -350,6 +372,10 @@ void LibcameraSource::handle_request(libcamera::Request* request) {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        //ready_frames_.push_back(std::move(frame));
+        constexpr size_t MAX_QUEUE = 2;
+        if (ready_frames_.size() >= MAX_QUEUE)
+            ready_frames_.pop_front();
         ready_frames_.push_back(std::move(frame));
     }
     cv_.notify_one();
@@ -422,3 +448,5 @@ std::unique_ptr<FrameSource> make_libcamera_source(const LibcameraConfig&) {
 } // namespace rawudp
 
 #endif
+
+
