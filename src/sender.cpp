@@ -16,6 +16,7 @@
 #include "crc32.h"
 #include "frame_source.h"
 #include "generator.h"
+#include "gstreamer_source.h"
 #include "libcamera_source.h"
 #include "protocol.h"
 
@@ -23,7 +24,7 @@ using namespace std::chrono;
 
 namespace rawudp {
 
-enum class SourceType { File, Generator, Libcamera };
+enum class SourceType { File, Generator, Libcamera, GStreamer };
 
 struct SenderOptions {
     std::string dest_ip = "127.0.0.1";
@@ -60,7 +61,7 @@ void usage(const char* argv0) {
               << "  --frames <n>           Number of frames to send (0 = infinite)\n"
               << "  --flow-id <id>         Flow identifier (default 1)\n"
               << "  --raw-file <path>      Replay raw file instead of synthetic pattern\n"
-              << "  --source <src>         file|generator|libcamera (default file)\n"
+              << "  --source <src>         file|generator|libcamera|gstreamer (default file)\n"
               << "  --camera <index>       Camera index for libcamera (default 0)\n"
               << "  --list-cameras         List available cameras and exit\n"
               << "  --effective-bits <N>   Sensor effective bits (default 12)\n"
@@ -71,6 +72,7 @@ SourceType parse_source(const std::string& name) {
     if (name == "file") return SourceType::File;
     if (name == "generator") return SourceType::Generator;
     if (name == "libcamera") return SourceType::Libcamera;
+    if (name == "gstreamer") return SourceType::GStreamer;
     throw std::invalid_argument("Unknown source: " + name);
 }
 
@@ -247,6 +249,17 @@ int main(int argc, char** argv) {
             std::cerr << "Failed to initialize libcamera source\n";
             return 1;
         }
+    } else if (opts.source == SourceType::GStreamer) {
+        GStreamerConfig cfg;
+        cfg.width = opts.width;
+        cfg.height = opts.height;
+        cfg.container_bits = opts.container_bits;
+        cfg.effective_bits = opts.effective_bits;
+        source = make_gstreamer_source(cfg);
+        if (!source) {
+            std::cerr << "Failed to initialize GStreamer source\n";
+            return 1;
+        }
     }
 
     if (!source) {
@@ -269,7 +282,8 @@ int main(int argc, char** argv) {
     }
 
     const Crc32 crc;
-    const bool throttle = opts.source != SourceType::Libcamera;
+    const bool throttle = opts.source != SourceType::Libcamera &&
+                          opts.source != SourceType::GStreamer;
     const auto frame_interval = throttle ? duration<double>(1.0 / std::max<uint32_t>(1, opts.fps))
                                          : duration<double>(0);
     auto next_time = steady_clock::now();
