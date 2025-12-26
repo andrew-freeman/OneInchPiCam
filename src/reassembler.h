@@ -5,6 +5,7 @@
 #include <map>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
 
 #include "protocol.h"
 
@@ -13,6 +14,8 @@ namespace rawudp {
 struct CompletedFrame {
     RawUdpHeader header;
     std::vector<uint8_t> data;
+    std::chrono::steady_clock::time_point first_packet_time;
+    std::chrono::steady_clock::time_point complete_time;
 };
 
 class Reassembler {
@@ -21,7 +24,7 @@ public:
 
     // Returns true and fills out when a frame is completed.
     bool add_fragment(const RawUdpHeader& header, const uint8_t* payload, std::size_t payload_size,
-                      CompletedFrame& out);
+                      CompletedFrame& out, std::chrono::steady_clock::time_point recv_time);
 
     std::size_t dropped_frames() const { return dropped_frames_; }
 
@@ -32,6 +35,8 @@ private:
         std::vector<uint8_t> buffer;
         std::vector<bool> fragments;
         uint32_t received_fragments = 0;
+        std::chrono::steady_clock::time_point first_packet_time;
+        bool have_first_time = false;
     };
 
     using FrameMap = std::map<uint32_t, FrameAssembly>;

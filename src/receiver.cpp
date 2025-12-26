@@ -5,16 +5,19 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "crc32.h"
+#include "frame_decoder.h"
 #include "preview.h"
 #include "protocol.h"
 #include "reassembler.h"
@@ -155,6 +158,7 @@ bool validate_packet(const uint8_t* data, std::size_t len, RawUdpHeader& host_hd
     host_hdr.width = net_to_host16(net_hdr.width);
     host_hdr.height = net_to_host16(net_hdr.height);
     host_hdr.bit_depth = net_hdr.bit_depth;
+    host_hdr.raw_encoding = net_hdr.raw_encoding;
     host_hdr.pixel_format = net_hdr.pixel_format;
     host_hdr.packing = net_hdr.packing;
     host_hdr.reserved = net_hdr.reserved;
@@ -170,19 +174,22 @@ bool validate_packet(const uint8_t* data, std::size_t len, RawUdpHeader& host_hd
     return true;
 }
 
-bool write_raw(const std::string& dir, const CompletedFrame& frame) {
+bool write_raw(const std::string& dir, const DecodedFrame& frame, uint32_t frame_id) {
     namespace fs = std::filesystem;
     fs::create_directories(dir);
-    const auto filename = dir + "/raw_frame_" + std::to_string(frame.header.frame_id) + "_" +
-                          std::to_string(frame.header.width) + "x" +
-                          std::to_string(frame.header.height) + "_" +
-                          std::to_string(frame.header.bit_depth) + "b.raw";
+    const auto filename = dir + "/raw_frame_" + std::to_string(frame_id) + "_" +
+                          std::to_string(frame.width) + "x" + std::to_string(frame.height) +
+                          "_" + std::to_string(frame.bit_depth) + "b.raw";
     std::ofstream out(filename, std::ios::binary);
     if (!out) {
         std::cerr << "Failed to write " << filename << "\n";
         return false;
     }
-    out.write(reinterpret_cast<const char*>(frame.data.data()), frame.data.size());
+    for (uint16_t y = 0; y < frame.height; ++y) {
+        const uint16_t* row =
+            frame.pixels.data() + static_cast<std::size_t>(y) * frame.stride_pixels;
+        out.write(reinterpret_cast<const char*>(row), frame.width * sizeof(uint16_t));
+    }
     return true;
 }
 
@@ -230,7 +237,9 @@ int main(int argc, char** argv) {
     uint64_t bytes_received = 0;
     uint64_t frames_interval = 0;
     uint64_t frames_completed_total = 0;
-    double latency_ms_avg = 0.0;
+    double rx_age_ms_avg = 0.0;
+    double sender_latency_ms_avg = 0.0;
+    bool sender_latency_valid = false;
     uint32_t max_reorder = 0;
     std::unordered_map<uint32_t, uint32_t> latest_frame;
 
@@ -266,22 +275,49 @@ int main(int argc, char** argv) {
 
         CompletedFrame frame;
         const uint8_t* payload = buffer.data() + host_hdr.header_size;
-        if (reasm.add_fragment(host_hdr, payload, host_hdr.payload_size, frame)) {
+        if (reasm.add_fragment(host_hdr, payload, host_hdr.payload_size, frame, now)) {
             frames_interval++;
             frames_completed_total++;
+
+            DecodedFrame decoded;
+            if (!decode_frame(frame, decoded)) {
+                continue;
+            }
+
+            const double receiver_age_ms =
+                duration_cast<duration<double, std::milli>>(frame.complete_time -
+                                                            frame.first_packet_time)
+                    .count();
+            rx_age_ms_avg = rx_age_ms_avg * 0.9 + receiver_age_ms * 0.1;
+
+            std::optional<double> sender_latency_sample;
             if (frame.header.timestamp_us != 0) {
-                uint64_t now_us = duration_cast<microseconds>(now.time_since_epoch()).count();
-                double latency_ms = static_cast<double>(now_us - frame.header.timestamp_us) / 1000.0;
-                latency_ms_avg = latency_ms_avg * 0.9 + latency_ms * 0.1;
+                const uint64_t now_us =
+                    duration_cast<microseconds>(frame.complete_time.time_since_epoch()).count();
+                const double latency_ms =
+                    static_cast<double>(now_us - frame.header.timestamp_us) / 1000.0;
+                if (std::abs(latency_ms) < 10000.0) {
+                    sender_latency_sample = latency_ms;
+                    if (sender_latency_valid) {
+                        sender_latency_ms_avg = sender_latency_ms_avg * 0.9 + latency_ms * 0.1;
+                    } else {
+                        sender_latency_ms_avg = latency_ms;
+                        sender_latency_valid = true;
+                    }
+                } else {
+                    sender_latency_valid = false;
+                }
+            } else {
+                sender_latency_valid = false;
             }
 
             if (!opts.record_dir.empty()) {
-                write_raw(opts.record_dir, frame);
+                write_raw(opts.record_dir, decoded, frame.header.frame_id);
             }
 
             std::vector<uint8_t> preview_bgr;
             int out_w = 0, out_h = 0;
-            if (render_preview(frame.header, frame.data, preview_cfg, preview_bgr, out_w, out_h)) {
+            if (render_preview(decoded, preview_cfg, preview_bgr, out_w, out_h)) {
                 display_preview(preview_bgr, out_w, out_h, "rawudp", opts.headless);
             }
         }
@@ -292,13 +328,16 @@ int main(int argc, char** argv) {
                 duration_cast<duration<double>>(now_print - last_print).count();
             double mbps = (bytes_received * 8.0) / (seconds_elapsed * 1e6);
             double fps = frames_interval / seconds_elapsed;
+            std::string sender_latency_str =
+                sender_latency_valid ? std::to_string(sender_latency_ms_avg) : "n/a";
             std::cout << "Stats: "
                       << "fps=" << fps << " "
                       << "mbps=" << mbps << " "
                       << "frames_total=" << frames_completed_total << " "
                       << "dropped=" << reasm.dropped_frames() << " "
                       << "reorder=" << max_reorder << " "
-                      << "latency_ms~" << latency_ms_avg << "\n";
+                      << "rx_age_ms~" << rx_age_ms_avg << " "
+                      << "sender_latency_ms~" << sender_latency_str << "\n";
             bytes_received = 0;
             frames_interval = 0;
             last_print = now_print;
