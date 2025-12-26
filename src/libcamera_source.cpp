@@ -191,21 +191,44 @@ void LibcameraSource::unmap_all() {
     mapped_buffers_.clear();
 }
 
-void LibcameraSource::choose_format(libcamera::StreamConfiguration& cfg) {
-    const libcamera::StreamFormats& formats = cfg.formats();
+void LibcameraSource::choose_format(libcamera::StreamConfiguration& cfg)
+{
+    const auto& formats = cfg.formats();
+
+    // dump formats + sizes
+    for (const auto& fmt : formats.pixelformats()) {
+        std::cerr << "Format supported: " << fmt.toString() << "\n";
+        for (const auto& sz : formats.sizes(fmt)) {
+            std::cerr << "  size: " << sz.width << "x" << sz.height << "\n";
+        }
+    }
+
     for (const auto& fmt : formats.pixelformats()) {
         const std::string name = fmt.toString();
-        if ((name.find("RGGB") != std::string::npos ||
-             name.find("BGGR") != std::string::npos ||
-             name.find("GRBG") != std::string::npos ||
-             name.find("GBRG") != std::string::npos) &&
-            name.find("16") != std::string::npos) {
+
+        if (name.find("PISP_COMP") != std::string::npos) continue;
+
+        if (name.find("SRGGB") != std::string::npos ||
+            name.find("SBGGR") != std::string::npos ||
+            name.find("SGRBG") != std::string::npos ||
+            name.find("SGBRG") != std::string::npos)
+        {
             cfg.pixelFormat = fmt;
+
+            // choose the best matching size *actually supported for this fmt*
+            auto sizes = formats.sizes(fmt);
+            if (!sizes.empty()) {
+                // pick max size (or pick closest to requested cfg_.width/height)
+                cfg.size = sizes.back();
+            }
+
+            std::cerr << "Selected RAW stream: " << name
+                      << " @ " << cfg.size.width << "x" << cfg.size.height << "\n";
             return;
         }
     }
-    // Fall back to default provided by libcamera.
 }
+
 
 bool LibcameraSource::start() {
     manager_ = std::make_unique<libcamera::CameraManager>();
@@ -236,6 +259,29 @@ bool LibcameraSource::start() {
         std::cerr << "Failed to generate configuration\n";
         return false;
     }
+
+    auto st = config_->validate();
+    std::cerr << "validate() status = " << int(st) << "\n";
+    std::cerr << "After validate: " << config_->at(0).pixelFormat.toString() << "\n";
+
+    if (camera_->configure(config_.get())) {
+        std::cerr << "Failed to configure camera\n";
+        return false;
+    }
+
+    std::cerr << "After configure: " << config_->at(0).pixelFormat.toString() << "\n";
+
+    const std::string chosen = config_->at(0).pixelFormat.toString();
+    if (chosen.find("PISP_COMP") != std::string::npos) {
+        std::cerr
+            << "ERROR: libcamera forced PiSP compressed RAW (" << chosen << ").\n"
+            << "Your CSI2P unpacker cannot decode this. Either:\n"
+            << "  (A) force CSI2P by choosing a supported size/format combo, or\n"
+            << "  (B) use GStreamer libcamerasrc (like your Python pipeline), or\n"
+            << "  (C) implement PiSP decompression.\n";
+        return false;
+    }
+
     libcamera::StreamConfiguration& stream_cfg = config_->at(0);
     if (cfg_.width > 0 && cfg_.height > 0) {
         stream_cfg.size.width = cfg_.width;
@@ -294,6 +340,9 @@ bool LibcameraSource::start() {
     }
 
     valid_ = true;
+    std::cerr << "libcamera pixel format: " << stream_cfg.pixelFormat.toString() << "\n";
+
+
     return true;
 }
 
