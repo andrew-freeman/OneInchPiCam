@@ -15,12 +15,6 @@ namespace {
 
 enum class Channel { R, G, B };
 
-uint8_t effective_bits_from_header(const RawUdpHeader& header) {
-    uint8_t bits = header.reserved != 0 ? header.reserved : header.bit_depth;
-    bits = std::clamp<uint8_t>(bits, 1, 16);
-    return bits;
-}
-
 double max_value_for_bits(uint8_t bits) {
     if (bits >= 16) {
         return 65535.0;
@@ -46,10 +40,6 @@ Channel channel_at(int x, int y, PixelFormat fmt) {
     return Channel::G;
 }
 
-uint16_t read_le16(const std::vector<uint8_t>& data, std::size_t index) {
-    return static_cast<uint16_t>(data[index] | (static_cast<uint16_t>(data[index + 1]) << 8));
-}
-
 uint8_t tone_map(double value, double max_value, const PreviewConfig& cfg, float gain) {
     const double adjusted = std::max(0.0, value) * gain;
     const double clamped = std::min(adjusted, max_value);
@@ -61,60 +51,64 @@ uint8_t tone_map(double value, double max_value, const PreviewConfig& cfg, float
     return static_cast<uint8_t>(std::clamp(scaled, 0, 255));
 }
 
-void mono_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-               const PreviewConfig& cfg, std::vector<uint8_t>& bgr, double maxv) {
-    const std::size_t pixel_count = static_cast<std::size_t>(header.width) * header.height;
+void mono_view(const DecodedFrame& frame, const PreviewConfig& cfg, std::vector<uint8_t>& bgr,
+               double maxv) {
+    const std::size_t pixel_count = static_cast<std::size_t>(frame.width) * frame.height;
     bgr.resize(pixel_count * 3);
-    for (std::size_t i = 0; i < pixel_count; ++i) {
-        uint16_t raw = read_le16(frame_data, i * 2);
-        const double value = std::max<int>(0, static_cast<int>(raw) - cfg.black_level);
-        uint8_t v = tone_map(value, maxv, cfg, cfg.wb_g);
-        bgr[i * 3 + 0] = v;
-        bgr[i * 3 + 1] = v;
-        bgr[i * 3 + 2] = v;
-    }
-}
-
-void green_only_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-                     const PreviewConfig& cfg, std::vector<uint8_t>& bgr, double maxv) {
-    const std::size_t pixel_count = static_cast<std::size_t>(header.width) * header.height;
-    bgr.resize(pixel_count * 3);
-    for (int y = 0; y < header.height; ++y) {
-        for (int x = 0; x < header.width; ++x) {
-            const std::size_t idx = static_cast<std::size_t>(y) * header.width + x;
-            Channel c = channel_at(x, y, static_cast<PixelFormat>(header.pixel_format));
-            if (c != Channel::G) {
-                continue;
-            }
-            uint16_t raw = read_le16(frame_data, idx * 2);
+    for (int y = 0; y < frame.height; ++y) {
+        for (int x = 0; x < frame.width; ++x) {
+            const std::size_t idx = static_cast<std::size_t>(y) * frame.stride_pixels + x;
+            const uint16_t raw = frame.pixels[idx];
             const double value = std::max<int>(0, static_cast<int>(raw) - cfg.black_level);
             uint8_t v = tone_map(value, maxv, cfg, cfg.wb_g);
-            bgr[idx * 3 + 0] = v;
-            bgr[idx * 3 + 1] = v;
-            bgr[idx * 3 + 2] = v;
+            const std::size_t out_idx = static_cast<std::size_t>(y) * frame.width + x;
+            bgr[out_idx * 3 + 0] = v;
+            bgr[out_idx * 3 + 1] = v;
+            bgr[out_idx * 3 + 2] = v;
         }
     }
 }
 
-void half_res_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-                   const PreviewConfig& cfg, std::vector<uint8_t>& bgr, int& out_w, int& out_h,
-                   double maxv) {
-    out_w = header.width / 2;
-    out_h = header.height / 2;
+void green_only_view(const DecodedFrame& frame, const PreviewConfig& cfg,
+                     std::vector<uint8_t>& bgr, double maxv) {
+    const std::size_t pixel_count = static_cast<std::size_t>(frame.width) * frame.height;
+    bgr.assign(pixel_count * 3, 0);
+    for (int y = 0; y < frame.height; ++y) {
+        for (int x = 0; x < frame.width; ++x) {
+            const std::size_t idx = static_cast<std::size_t>(y) * frame.stride_pixels + x;
+            Channel c = channel_at(x, y, static_cast<PixelFormat>(frame.pixel_format));
+            if (c != Channel::G) {
+                continue;
+            }
+            const uint16_t raw = frame.pixels[idx];
+            const double value = std::max<int>(0, static_cast<int>(raw) - cfg.black_level);
+            uint8_t v = tone_map(value, maxv, cfg, cfg.wb_g);
+            const std::size_t out_idx = static_cast<std::size_t>(y) * frame.width + x;
+            bgr[out_idx * 3 + 0] = v;
+            bgr[out_idx * 3 + 1] = v;
+            bgr[out_idx * 3 + 2] = v;
+        }
+    }
+}
+
+void half_res_view(const DecodedFrame& frame, const PreviewConfig& cfg, std::vector<uint8_t>& bgr,
+                   int& out_w, int& out_h, double maxv) {
+    out_w = frame.width / 2;
+    out_h = frame.height / 2;
     bgr.assign(static_cast<std::size_t>(out_w) * out_h * 3, 0);
-    for (int y = 0; y + 1 < header.height; y += 2) {
-        for (int x = 0; x + 1 < header.width; x += 2) {
-            const std::size_t idx00 = static_cast<std::size_t>(y) * header.width + x;
+    for (int y = 0; y + 1 < frame.height; y += 2) {
+        for (int x = 0; x + 1 < frame.width; x += 2) {
+            const std::size_t idx00 = static_cast<std::size_t>(y) * frame.stride_pixels + x;
             const std::size_t idx01 = idx00 + 1;
-            const std::size_t idx10 = idx00 + header.width;
+            const std::size_t idx10 = idx00 + frame.stride_pixels;
             const std::size_t idx11 = idx10 + 1;
-            const uint16_t p00 = read_le16(frame_data, idx00 * 2);
-            const uint16_t p01 = read_le16(frame_data, idx01 * 2);
-            const uint16_t p10 = read_le16(frame_data, idx10 * 2);
-            const uint16_t p11 = read_le16(frame_data, idx11 * 2);
+            const uint16_t p00 = frame.pixels[idx00];
+            const uint16_t p01 = frame.pixels[idx01];
+            const uint16_t p10 = frame.pixels[idx10];
+            const uint16_t p11 = frame.pixels[idx11];
 
             double r = 0, g = 0, b = 0;
-            const PixelFormat fmt = static_cast<PixelFormat>(header.pixel_format);
+            const PixelFormat fmt = static_cast<PixelFormat>(frame.pixel_format);
             Channel c00 = channel_at(x, y, fmt);
             Channel c01 = channel_at(x + 1, y, fmt);
             Channel c10 = channel_at(x, y + 1, fmt);
@@ -144,17 +138,17 @@ void half_res_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame
     }
 }
 
-void bilinear_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-                   const PreviewConfig& cfg, std::vector<uint8_t>& bgr, double maxv) {
-    const int w = header.width;
-    const int h = header.height;
+void bilinear_view(const DecodedFrame& frame, const PreviewConfig& cfg,
+                   std::vector<uint8_t>& bgr, double maxv) {
+    const int w = frame.width;
+    const int h = frame.height;
     bgr.assign(static_cast<std::size_t>(w) * h * 3, 0);
-    const PixelFormat fmt = static_cast<PixelFormat>(header.pixel_format);
+    const PixelFormat fmt = static_cast<PixelFormat>(frame.pixel_format);
 
     auto sample = [&](int x, int y) -> uint16_t {
         x = std::clamp(x, 0, w - 1);
         y = std::clamp(y, 0, h - 1);
-        return read_le16(frame_data, (static_cast<std::size_t>(y) * w + x) * 2);
+        return frame.pixels[static_cast<std::size_t>(y) * frame.stride_pixels + x];
     };
 
     for (int y = 0; y < h; ++y) {
@@ -198,38 +192,33 @@ void bilinear_view(const RawUdpHeader& header, const std::vector<uint8_t>& frame
 
 } // namespace
 
-bool render_preview(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-                    const PreviewConfig& cfg, std::vector<uint8_t>& bgr, int& out_width,
-                    int& out_height) {
-    const uint8_t effective_bits = effective_bits_from_header(header);
-    if (effective_bits == 0 || effective_bits > 16 || header.bit_depth == 0 ||
-        header.bit_depth > 16) {
-        std::cerr << "Unsupported bit depth: "
-                  << "container=" << static_cast<int>(header.bit_depth)
-                  << " effective=" << static_cast<int>(effective_bits) << "\n";
+bool render_preview(const DecodedFrame& frame, const PreviewConfig& cfg,
+                    std::vector<uint8_t>& bgr, int& out_width, int& out_height) {
+    if (frame.bit_depth == 0 || frame.bit_depth > 16) {
+        std::cerr << "Unsupported bit depth: effective=" << static_cast<int>(frame.bit_depth) << "\n";
         return false;
     }
-    if (frame_data.size() < static_cast<std::size_t>(header.width) * header.height * 2) {
-        std::cerr << "Frame data too small for preview\n";
+    if (frame.pixels.size() < static_cast<std::size_t>(frame.stride_pixels) * frame.height) {
+        std::cerr << "Frame buffer too small for preview\n";
         return false;
     }
 
-    out_width = header.width;
-    out_height = header.height;
-    const double maxv = max_value_for_bits(effective_bits);
+    out_width = frame.width;
+    out_height = frame.height;
+    const double maxv = max_value_for_bits(frame.bit_depth);
 
     switch (cfg.mode) {
     case ViewMode::Mono:
-        mono_view(header, frame_data, cfg, bgr, maxv);
+        mono_view(frame, cfg, bgr, maxv);
         break;
     case ViewMode::GreenOnly:
-        green_only_view(header, frame_data, cfg, bgr, maxv);
+        green_only_view(frame, cfg, bgr, maxv);
         break;
     case ViewMode::HalfRes:
-        half_res_view(header, frame_data, cfg, bgr, out_width, out_height, maxv);
+        half_res_view(frame, cfg, bgr, out_width, out_height, maxv);
         break;
     case ViewMode::Bilinear:
-        bilinear_view(header, frame_data, cfg, bgr, maxv);
+        bilinear_view(frame, cfg, bgr, maxv);
         break;
     }
     return true;
@@ -256,3 +245,4 @@ bool display_preview(const std::vector<uint8_t>& bgr, int width, int height,
 }
 
 } // namespace rawudp
+

@@ -50,6 +50,7 @@ bool RawFileSource::get_frame(uint8_t*& data, size_t& size_bytes, uint64_t& time
     meta.width = width_;
     meta.height = height_;
     meta.pixel_format = pixel_format_;
+    meta.raw_encoding = RawEncoding::RawUncompressed;
     meta.container_bits = container_bits_;
     meta.effective_bits = effective_bits_;
     return true;
@@ -80,6 +81,7 @@ bool SyntheticSource::get_frame(uint8_t*& data, size_t& size_bytes, uint64_t& ti
     meta.width = width_;
     meta.height = height_;
     meta.pixel_format = pixel_format_;
+    meta.raw_encoding = RawEncoding::RawUncompressed;
     meta.container_bits = container_bits_;
     meta.effective_bits = effective_bits_;
     return true;
