@@ -183,6 +183,7 @@ void build_header(RawUdpHeader& hdr, const SenderOptions& opts, const FrameMeta&
     hdr.width = host_to_net16(static_cast<uint16_t>(meta.width));
     hdr.height = host_to_net16(static_cast<uint16_t>(meta.height));
     hdr.bit_depth = static_cast<uint8_t>(meta.container_bits);
+    hdr.raw_encoding = static_cast<uint8_t>(meta.raw_encoding);
     hdr.pixel_format = static_cast<uint8_t>(meta.pixel_format);
     hdr.packing = static_cast<uint8_t>(opts.packing);
     hdr.reserved = static_cast<uint8_t>(std::min<uint16_t>(meta.effective_bits, 0xff));

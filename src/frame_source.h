@@ -14,6 +14,7 @@ struct FrameMeta {
     int width = 0;
     int height = 0;
     PixelFormat pixel_format = PixelFormat::RGGB;
+    RawEncoding raw_encoding = RawEncoding::RawUncompressed;
     uint16_t container_bits = 16;
     uint16_t effective_bits = 12;
 };

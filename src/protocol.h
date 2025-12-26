@@ -24,6 +24,11 @@ enum class Packing : uint8_t {
     PACKED_12 = 1,
 };
 
+enum class RawEncoding : uint8_t {
+    RawUncompressed = 0,
+    RawPiSpComp1 = 1,
+};
+
 #pragma pack(push, 1)
 struct RawUdpHeader {
     uint32_t magic;
@@ -40,6 +45,7 @@ struct RawUdpHeader {
     uint16_t height;
 
     uint8_t bit_depth;
+    uint8_t raw_encoding;
     uint8_t pixel_format;
     uint8_t packing;
     uint8_t reserved;

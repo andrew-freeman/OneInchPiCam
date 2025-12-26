@@ -14,6 +14,7 @@ target_include_directories(rawudp_protocol INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}
 
 add_library(rawudp_common
     src/generator.cpp
+    src/frame_decoder.cpp
     src/reassembler.cpp
     src/preview.cpp
 )

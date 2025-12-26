@@ -1,6 +1,8 @@
 #include "gstreamer_source.h"
 #include "frame_source.h"
 
+#ifdef RAWUDP_HAVE_GSTREAMER
+
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 
@@ -165,6 +167,7 @@ bool GStreamerFrameSource::get_frame(uint8_t*& data,
         meta_.width = width;
         meta_.height = height;
         meta_.pixel_format = PixelFormat::RGGB;
+        meta_.raw_encoding = RawEncoding::RawUncompressed;
         meta_.container_bits = 16;
         meta_.effective_bits = cfg_.effective_bits;
 
@@ -214,3 +217,19 @@ std::unique_ptr<FrameSource> make_gstreamer_source(const GStreamerConfig& cfg)
 }
 
 } // namespace rawudp
+
+#else // RAWUDP_HAVE_GSTREAMER
+
+#include <iostream>
+
+namespace rawudp {
+
+std::unique_ptr<FrameSource> make_gstreamer_source(const GStreamerConfig&)
+{
+    std::cerr << "GStreamer support not built; rebuild with RAWUDP_HAVE_GSTREAMER\n";
+    return nullptr;
+}
+
+} // namespace rawudp
+
+#endif // RAWUDP_HAVE_GSTREAMER

@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "protocol.h"
+#include "frame_decoder.h"
 
 namespace rawudp {
 
@@ -27,9 +27,8 @@ struct PreviewConfig {
 
 // Converts a raw frame (little-endian UNPACKED_16) into an 8-bit BGR preview buffer.
 // Returns false if preview cannot be generated (e.g., missing OpenCV when display requested).
-bool render_preview(const RawUdpHeader& header, const std::vector<uint8_t>& frame_data,
-                    const PreviewConfig& cfg, std::vector<uint8_t>& bgr, int& out_width,
-                    int& out_height);
+bool render_preview(const DecodedFrame& frame, const PreviewConfig& cfg,
+                    std::vector<uint8_t>& bgr, int& out_width, int& out_height);
 
 bool display_preview(const std::vector<uint8_t>& bgr, int width, int height,
                      const std::string& window_name, bool headless);

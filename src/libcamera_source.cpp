@@ -21,6 +21,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -41,6 +42,10 @@ PixelFormat parse_bayer_format(const std::string& fmt) {
     if (fmt.find("GRBG") != std::string::npos) return PixelFormat::GRBG;
     if (fmt.find("GBRG") != std::string::npos) return PixelFormat::GBRG;
     return PixelFormat::MONO;
+}
+
+bool is_pisp_comp1(const std::string& fmt) {
+    return fmt.find("PISP_COMP1") != std::string::npos;
 }
 
 //bool is_packed_raw(const std::string& fmt) {
@@ -203,10 +208,22 @@ void LibcameraSource::choose_format(libcamera::StreamConfiguration& cfg)
         }
     }
 
+    std::optional<libcamera::PixelFormat> pisp_fallback;
+    std::optional<libcamera::Size> pisp_size;
+
     for (const auto& fmt : formats.pixelformats()) {
         const std::string name = fmt.toString();
 
-        if (name.find("PISP_COMP") != std::string::npos) continue;
+        if (name.find("PISP_COMP") != std::string::npos) {
+            if (!pisp_fallback) {
+                pisp_fallback = fmt;
+                auto sizes = formats.sizes(fmt);
+                if (!sizes.empty()) {
+                    pisp_size = sizes.back();
+                }
+            }
+            continue;
+        }
 
         if (name.find("SRGGB") != std::string::npos ||
             name.find("SBGGR") != std::string::npos ||
@@ -226,6 +243,15 @@ void LibcameraSource::choose_format(libcamera::StreamConfiguration& cfg)
                       << " @ " << cfg.size.width << "x" << cfg.size.height << "\n";
             return;
         }
+    }
+
+    if (pisp_fallback) {
+        cfg.pixelFormat = *pisp_fallback;
+        if (pisp_size) {
+            cfg.size = *pisp_size;
+        }
+        std::cerr << "Selected PiSP compressed RAW stream: " << cfg.pixelFormat.toString()
+                  << " @ " << cfg.size.width << "x" << cfg.size.height << "\n";
     }
 }
 
@@ -272,15 +298,7 @@ bool LibcameraSource::start() {
     std::cerr << "After configure: " << config_->at(0).pixelFormat.toString() << "\n";
 
     const std::string chosen = config_->at(0).pixelFormat.toString();
-    if (chosen.find("PISP_COMP") != std::string::npos) {
-        std::cerr
-            << "ERROR: libcamera forced PiSP compressed RAW (" << chosen << ").\n"
-            << "Your CSI2P unpacker cannot decode this. Either:\n"
-            << "  (A) force CSI2P by choosing a supported size/format combo, or\n"
-            << "  (B) use GStreamer libcamerasrc (like your Python pipeline), or\n"
-            << "  (C) implement PiSP decompression.\n";
-        return false;
-    }
+    std::cerr << "Chosen pixel format after configure: " << chosen << "\n";
 
     libcamera::StreamConfiguration& stream_cfg = config_->at(0);
     if (cfg_.width > 0 && cfg_.height > 0) {
@@ -325,6 +343,8 @@ bool LibcameraSource::start() {
     meta_.height = stream_cfg.size.height;
     meta_.pixel_format = parse_bayer_format(stream_cfg.pixelFormat.toString());
     meta_.container_bits = detect_container_bits(stream_cfg.pixelFormat.toString(), cfg_.container_bits);
+    meta_.raw_encoding = is_pisp_comp1(stream_cfg.pixelFormat.toString()) ? RawEncoding::RawPiSpComp1
+                                                                          : RawEncoding::RawUncompressed;
     meta_.effective_bits = cfg_.effective_bits;
 
     // Use the requestCompleted signal to recycle the small buffer pool continuously.
@@ -373,13 +393,19 @@ bool LibcameraSource::copy_buffer(libcamera::FrameBuffer* buffer, std::vector<ui
                                     static_cast<std::size_t>(meta_.height);
 
     const std::string fmt = config_->at(0).pixelFormat.toString();
-    if (is_packed_raw(fmt)) {
+    const bool pisp_comp = meta_.raw_encoding == RawEncoding::RawPiSpComp1;
+    if (!pisp_comp && is_packed_raw(fmt)) {
         const int bits = packed_bits(fmt);
         if (bits == 12) {
             return unpack12(src, src_len, pixel_count, out);
         } else if (bits == 10) {
             return unpack10(src, src_len, pixel_count, out);
         }
+    }
+
+    if (pisp_comp) {
+        out.assign(src, src + src_len);
+        return true;
     }
 
     const std::size_t bytes_needed = pixel_count * 2;
@@ -497,5 +523,3 @@ std::unique_ptr<FrameSource> make_libcamera_source(const LibcameraConfig&) {
 } // namespace rawudp
 
 #endif
-
-
